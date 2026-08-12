@@ -1,0 +1,394 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: platform-environment-config
+data:
+  DB_HOST: "postgres-db-service"
+  DB_PORT: "5432"
+  DB_NAME: "oreilly_db"
+  DB_USER: "postgres_user"
+  REDIS_URL: "redis://redis-service:6379/0"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres-db
+  template:
+    metadata:
+      labels:
+        app: postgres-db
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:16-alpine
+        env:
+        - name: POSTGRES_DB
+          value: "oreilly_db"
+        - name: POSTGRES_USER
+          value: "postgres_user"
+        - name: POSTGRES_PASSWORD
+          value: "secure_password123"
+        ports:
+        - containerPort: 5432
+        volumeMounts:
+        - name: pg-storage
+          mountPath: /var/lib/postgresql/data
+      volumes:
+      - name: pg-storage
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-db-service
+spec:
+  ports:
+  - port: 5432
+    targetPort: 5432
+  selector:
+    app: postgres-db
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis-queue
+  template:
+    metadata:
+      labels:
+        app: redis-queue
+    spec:
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        ports:
+        - containerPort: 6379
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-service
+spec:
+  ports:
+  - port: 6379
+    targetPort: 6379
+  selector:
+    app: redis-queue
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: django-backend-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: django-app
+  template:
+    metadata:
+      labels:
+        app: django-app
+    spec:
+      containers: 
+      - name: django-core
+        image: us-central1-docker.pkg.dev/project-07b07895-ce76-40a4-835/learnrepo/django-backend:v2
+        imagePullPolicy: IfNotPresent               
+        command: ["/app/entrypoint.sh"]
+        args: [
+          "gunicorn", 
+          "base_project.wsgi:application", 
+          "--bind", "0.0.0.0:8000", 
+          "--workers", "4",            # Spins up 4 isolated parallel worker processes to bypass the GIL
+          "--threads", "2",            # Adds 2 threads per worker process to optimize internal I/O wait times
+          "--access-logfile", "-",     # Streams server access records straight to standard output streams
+          "--error-logfile", "-"       # Streams application trace errors straight to standard output streams
+        ]
+        envFrom:
+        - configMapRef:
+            name: platform-environment-config
+        env:
+          - name: DB_PASSWORD
+            value: "secure_password123"
+        ports:
+          - containerPort: 8000
+        # 1. STARTUP PROBE: Gives Gunicorn plenty of time to warm up and run migrations on cold boot
+        startupProbe:
+          httpGet:
+            path: /metrics/  # Hits our lightweight metrics view endpoint
+            port: 8000
+          initialDelaySeconds: 15
+          periodSeconds: 5
+          failureThreshold: 15  
+          
+        # 2. LIVENESS PROBE: Continuous audit to check if the Python thread has crashed or deadlocked
+        livenessProbe:
+          httpGet:
+            path: /metrics/
+            port: 8000
+          periodSeconds: 15
+          timeoutSeconds: 3     # Tolerant window: allows up to 3 seconds for a response during spikes
+          failureThreshold: 3   # Must fail 3 consecutive times (45 seconds) before K8s force-reboots the container
+          
+        # 3. READINESS PROBE: Confirms if the pod is fully healthy and ready to accept live user traffic
+        readinessProbe:
+          httpGet:
+            path: /metrics/
+            port: 8000
+          periodSeconds: 10
+          timeoutSeconds: 2
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: django-backend-service
+spec:
+  ports:
+  - port: 8000
+    targetPort: 8000
+  selector:
+    app: django-app
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: celery-worker-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: celery-worker
+  template:
+    metadata:
+      labels:
+        app: celery-worker
+    spec:
+      containers:
+      - name: worker
+        image: us-central1-docker.pkg.dev/project-07b07895-ce76-40a4-835/learnrepo/django-backend:v2
+        imagePullPolicy: IfNotPresent
+        command: ["celery", "-A", "base_project", "worker", "--loglevel=info"]
+        envFrom:
+        - configMapRef:
+            name: platform-environment-config
+        env:
+          - name: DB_PASSWORD
+            value: "secure_password123"
+---
+# 5. NODE.JS INTERNET-FACING EDGE GATEWAY PROXY PIPELINE (NodePort)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: node-stitcher-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: node-stitcher
+  template:
+    metadata:
+      labels:
+        app: node-stitcher
+    spec:
+      containers:
+      - name: node-gateway
+        image: us-central1-docker.pkg.dev/project-07b07895-ce76-40a4-835/learnrepo/node-stitcher:v1
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 3000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: node-stitcher-service
+spec:
+  type: NodePort  # Exposes the service endpoint outside of the cluster context boundary
+  ports:
+  - port: 3000
+    targetPort: 3000
+    nodePort: 32000  # Explicit cluster binding entry port to target natively
+  selector:
+    app: node-stitcher
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-server-conf
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 5s
+    scrape_configs:
+      - job_name: 'django-microservice'
+        metrics_path: '/metrics/'
+        static_configs:
+          - targets: ['django-backend-service:8000']
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus-server
+  template:
+    metadata:
+      labels:
+        app: prometheus-server
+    spec:
+      containers:
+      - name: prometheus
+        image: prom/prometheus:v2.45.0
+        args:
+          - "--config.file=/etc/prometheus/prometheus.yml"
+          - "--storage.tsdb.path=/prometheus/"
+        ports:
+        - containerPort: 9090
+        volumeMounts:
+        - name: config-volume
+          mountPath: /etc/prometheus/
+      volumes:
+      - name: config-volume
+        configMap:
+          name: prometheus-server-conf
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus-service
+spec:
+  type: NodePort
+  ports:
+  - port: 9090
+    targetPort: 9090
+    nodePort: 32090 # Exposes the metrics dashboard interface publicly on Port 32090
+  selector:
+    app: prometheus-server
+---
+---
+# GRAFANA ANALYTICS DASHBOARD CONTAINER ENGINE
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grafana-server
+  template:
+    metadata:
+      labels:
+        app: grafana-server
+    spec:
+      containers:
+      - name: grafana
+        image: grafana/grafana:10.2.0
+        ports:
+        - containerPort: 3000
+        env:
+        # bypass initial admin password change prompts for quick local demos
+        - name: GF_SECURITY_ADMIN_PASSWORD
+          value: "secure_admin_pass"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana-service
+spec:
+  type: NodePort
+  ports:
+  - port: 3000
+    targetPort: 3000
+    nodePort: 32300 # Exposes the Grafana UI publicly on Port 32300
+  selector:
+    app: grafana-server
+---
+---
+#PGADMIN DATABASE VISUALIZATION MANAGEMENT PANEL
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pgadmin-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pgadmin-server
+  template:
+    metadata:
+      labels:
+        app: pgadmin-server
+    spec:
+      containers:
+      - name: pgadmin
+        image: dpage/pgadmin4:8.4
+        ports:
+        - containerPort: 80
+        env:
+        - name: PGADMIN_DEFAULT_EMAIL
+          value: "admin@oreilly.demo"
+        - name: PGADMIN_DEFAULT_PASSWORD
+          value: "secure_admin_pass"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pgadmin-service
+spec:
+  type: NodePort
+  ports:
+  - port: 80
+    targetPort: 80
+    nodePort: 32400 # Exposes pgAdmin UI on Port 32400
+  selector:
+    app: pgadmin-server
+---
+#REDIS COMMANDER MESSAGE QUEUE VISUALIZER
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-commander-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis-commander
+  template:
+    metadata:
+      labels:
+        app: redis-commander
+    spec:
+      containers:
+      - name: redis-commander
+        image: rediscommander/redis-commander:latest
+        ports:
+        - containerPort: 8081
+        env:
+        # Tell the visualizer where Redis lives using internal cluster DNS routing
+        - name: REDIS_HOSTS
+          value: "local-redis:redis-service:6379"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-commander-service
+spec:
+  type: NodePort
+  ports:
+  - port: 8081
+    targetPort: 8081
+    nodePort: 32500 # Exposes Redis Commander UI on Port 32500
+  selector:
+    app: redis-commander

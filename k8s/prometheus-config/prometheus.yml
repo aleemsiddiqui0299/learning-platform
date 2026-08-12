@@ -1,0 +1,10 @@
+global:
+  scrape_interval: 5s
+
+
+scrape_configs:
+  - job_name: 'django-microservice'
+    metrics_path: '/metrics/' # Hits the custom view exposed on Django
+    static_configs:
+      - targets: ['django-backend-service:8000']
+
